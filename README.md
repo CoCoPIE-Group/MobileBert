@@ -4,7 +4,7 @@
 
 This repo is tested on Python 3.6+, PyTorch 1.0.0+ (PyTorch 1.3.1+ for examples). 
 
-For the running environment, use the code under transformers to install the transformers package in the docker as below.
+For the running environment, use the code under the transformers directory to install the transformers package in the docker as below.
 ```bash
 cd transformers
 pip install .
