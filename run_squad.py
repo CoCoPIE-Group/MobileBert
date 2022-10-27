@@ -30,7 +30,6 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 import yaml
-import json
 import prune_util
 
 import testers
@@ -1076,8 +1075,9 @@ def main():
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
-
-    #model = deleteEncodingLayers(model,10)
+    
+    #######remove layers
+    #model = deleteEncodingLayers(model,5)
 
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
