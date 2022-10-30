@@ -29,6 +29,13 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
+import yaml
+import json
+import prune_util
+
+import testers
+import torch.nn as nn
+import copy
 from transformers import (
     MODEL_FOR_QUESTION_ANSWERING_MAPPING,
     WEIGHTS_NAME,
@@ -99,7 +106,15 @@ def train(args, train_dataset, model, tokenizer, args_ai):
         },
         {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    if args.rew:
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    elif args.masked_retrain:
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr_retrain, eps=args.adam_epsilon)
+    else:
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    #optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
@@ -174,10 +189,269 @@ def train(args, train_dataset, model, tokenizer, args_ai):
     # Added here for reproductibility
     set_seed(args)
 
+    layers = []
+    layers_names = []
+    for name, param in (model.named_parameters()):
+        if len(param.shape) >= 2:
+               # iii += 1
+                layers.append(param)
+                layers_names.append(name)
+                #print(name, "\n", list(param.shape))
+                # print(iii,'th parameter:''\tlen:', len(param.shape), '\t\t', name, '\t\tWeight shape: ', param.shape)
+                # print('    {}:\n        {}'.format(name,str(0.001)))
+                print(name)
+    print('len(layers) = ', len(layers))
+
+    if args.rew:
+        # penalty:
+        penalty_factors = []
+        with open("./profile/" + args.penalty_config_file + ".yaml", "r") as stream:
+            try:
+                raw_dict = yaml.full_load(stream)
+                penalty_factors = raw_dict['penalty_factors']
+            except yaml.YAMLError as exc:
+                print(exc)
+
+
+        # Display names and weights of the model.named_parameters():
+        layers = []
+        layers_names = []
+        iii = 0
+        for name, param in (model.named_parameters()):
+            if len(param.shape) >= 2:
+                iii += 1
+                layers.append(param)
+                layers_names.append(name)
+                #print(name, "\n", list(param.shape))
+                # print(iii,'th parameter:''\tlen:', len(param.shape), '\t\t', name, '\t\tWeight shape: ', param.shape)
+                # print('    {}:\n        {}'.format(name,str(0.001)))
+               # print(name)
+        print('len(layers) = ', len(layers))
+
+
+        # initialize rew_layer
+        eps = 1e-3
+        block_row_division = args.block_row_division
+        block_row_width = args.block_row_width
+        rew_layers = []
+        for i in range(len(layers)):
+            conv_layer = layers[i]
+
+            if (args.sparsity_type == "block_filter"): # -libn
+                shape = conv_layer.shape
+                conv = conv_layer.reshape(shape[0],-1)
+
+                if block_row_width != 0:
+                    if conv.shape[1]%block_row_width != 0 :
+                        print("the layer size is not divisible by block_row_width:",conv.shape[1], block_row_width)
+                        # raise SyntaxError("block_size error")
+                    block_row_division = int(conv.shape[1]/block_row_width)
+                else:
+                    if conv.shape[1]%block_row_division != 0 :
+                        print("the layer size is not divisible by block_row_division",conv.shape[1], block_row_division)
+                        # raise SyntaxError("block_size error")
+                convfrag = torch.chunk(conv, block_row_division, dim=1)
+
+                mat = None
+                for j in range(len(convfrag)):
+                    if mat is None:
+                        mat = convfrag[j]
+                    else:
+                        mat = torch.cat((mat,convfrag[j]),0)
+
+                rew_layers.append(1 / (torch.norm(mat.data, dim=1) + eps))
+
+            elif args.sparsity_type == "block_column":
+                shape = conv_layer.shape
+                conv = conv_layer.reshape(shape[0],-1)
+                print('weight.shape', conv.shape)  #([30522, 768])
+                if shape[0] == 30522:
+                    conv = conv.expand(30720, 768)
+                if conv.shape[0]%block_row_width != 0 :
+                    print("the layer size is not divisible",conv.shape[0], block_row_width)
+                    # raise SyntaxError("block_size error")
+                convfrag = torch.chunk(conv, block_row_width, dim=0)
+
+                mat = None
+                for j in range(len(convfrag)):
+                    if mat is None:
+                        mat = convfrag[j]
+                    else:
+                        mat = torch.cat((mat,convfrag[j]),1)
+
+                rew_layers.append(1 / (torch.norm(mat.data, dim=0) + eps))
+            else:
+                raise SyntaxError("Unknown sparsity type")
+
+        milestone = [4,8,12,16]
+
+
+    # reweighted retraining: hard_prune + normal training. -libn
+    if args.masked_retrain:
+        prune_thresholds = []
+        if args.prune_ratio_config != None:
+            prune_file_name = args.prune_ratio_config
+            with open("./profile/" + args.prune_ratio_config + ".yaml", "r") as stream:
+                try:
+                    raw_dict = yaml.load(stream)
+                    prune_thresholds = raw_dict['prune_ratios']
+                except yaml.YAMLError as exc:
+                    print(exc)
+        else:
+            prune_file_name = args.prune_config_file
+            with open("./profile/" + args.prune_config_file + ".yaml", "r") as stream:
+                try:
+                    raw_dict = yaml.load(stream)
+                    prune_thresholds = raw_dict['prune_thresholds']
+                except yaml.YAMLError as exc:
+                    print(exc)
+
+        prune_util.hard_prune(args, prune_thresholds, model)
+
+
+    l1_loss = 0
+
+    #for _ in train_iterator:
     for epoch in train_iterator:
         CL.before_each_train_epoch(epoch=epoch)
+
+        if args.rew:
+            # training mask: to ensure that pruned weights keep being pruned. -libn
+            print("\nprogressive admm-train/re-train masking")
+            masks = {}
+            for name, W in (model.named_parameters()):
+                weight = W.cpu().detach().numpy()
+                non_zeros = weight != 0
+                non_zeros = non_zeros.astype(np.float32)
+                zero_mask = torch.from_numpy(non_zeros).to(args.device)
+                W = torch.from_numpy(weight).to(args.device)
+                W.data = W
+                masks[name] = zero_mask
+
+        elif args.masked_retrain:
+            print("\nfull acc re-train masking")
+            masks = {}
+            for name, W in (model.named_parameters()):
+                weight = W.cpu().detach().numpy()
+                non_zeros = weight != 0
+                non_zeros = non_zeros.astype(np.float32)
+                zero_mask = torch.from_numpy(non_zeros).to(args.device)
+                W = torch.from_numpy(weight).to(args.device)
+                W.data = W
+                masks[name] = zero_mask
+
+
+
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+
+            if args.rew:
+                l1_loss = 0
+                # calculate R of each layer according to milestone. -libn
+                if step == 0 and epoch in milestone:
+                    print("reweighted l1 update")
+                    for j in range(len(layers)):
+
+                        if (args.sparsity_type == "block_filter"): # -libn
+                            shape = layers[j].shape
+                            conv = layers[j].reshape(shape[0], -1)      
+
+                            if block_row_width != 0:
+                                if conv.shape[1]%block_row_width != 0 :
+                                    print("the layer size is not divisible by block_row_width:",conv.shape[1], block_row_width)
+                                    # raise SyntaxError("block_size error")
+                                block_row_division = int(conv.shape[1]/block_row_width)
+                            else:
+                                if conv.shape[1]%block_row_division != 0 :
+                                    print("the layer size is not divisible by block_row_division",conv.shape[1], block_row_division)
+                                    # raise SyntaxError("block_size error")
+                            convfrag = torch.chunk(conv, block_row_division, dim=1)
+
+                            mat = None
+                            for k in range(len(convfrag)):
+                                if mat is None:
+                                    mat = convfrag[k]                       # if block_row_division = 8, convfrag[j].shape=[64,4]. -libn
+                                else:
+                                    mat = torch.cat((mat, convfrag[k]), 0)  # mat.shape=[64*num_blocks, 4]. -libn
+                            rew_layers[j] = (1 / (torch.norm(mat.data, dim=1) + eps))   # calculate the l2 norm of each row of mat. -> rew_layers[j].shape=[64*num_blocks]. -libn
+
+                        elif args.sparsity_type == "block_column":
+                            shape = layers[j].shape
+                            conv = layers[j].reshape(shape[0], -1)      # conv.shape=[64, 27]. -libn 
+                            # print('weight.shape', conv.shape)   
+                            if shape[0] == 30522:
+                                conv = conv.expand(30720, 768)
+                            if conv.shape[0] % block_row_width != 0:
+                                print("the layer size (cross_f) is not divisible", conv.shape[0], block_row_width)
+                                # raise SyntaxError("block_size error")
+                            convfrag = torch.chunk(conv, block_row_width, dim=0)   # if cross_f=8, convfrag[j].shape=[8,27]. -libn
+
+                            mat = None
+                            for k in range(len(convfrag)):
+                                if mat is None:
+                                    mat = convfrag[k]
+                                else:
+                                    mat = torch.cat((mat, convfrag[k]), 1)
+                            rew_layers[j] = (1 / (torch.norm(mat.data, dim=0) + eps))   
+                        else:
+                            raise SyntaxError("Unknown sparsity type")
+
+                # calculate l1_loss of each layer every epoch. -libn
+                for j in range(len(layers)):
+                    rew = rew_layers[j]
+                    conv_layer = layers[j]
+
+                    # block-filter:
+                    if (args.sparsity_type == "block_filter"): # -libn
+                        shape = layers[j].shape
+                        conv = layers[j].reshape(shape[0], -1)
+
+                        if block_row_width != 0:
+                            if conv.shape[1]%block_row_width != 0 :
+                                print("the layer size is not divisible by block_row_width:",conv.shape[1], block_row_width)
+                                # raise SyntaxError("block_size error")
+                            block_row_division = int(conv.shape[1]/block_row_width)
+                        else:
+                            if conv.shape[1]%block_row_division != 0 :
+                                print("the layer size is not divisible by block_row_division",conv.shape[1], block_row_division)
+                                # raise SyntaxError("block_size error")
+                        convfrag = torch.chunk(conv, block_row_division, dim=1)
+
+                        mat = None
+                        for k in range(len(convfrag)):
+                            if mat is None:
+                                mat = convfrag[k]
+                            else:
+                                mat = torch.cat((mat, convfrag[k]), 0)
+                        l1_loss = l1_loss + penalty_factors[layers_names[j]] * torch.sum(rew * torch.norm(mat, dim=1))
+
+                    elif args.sparsity_type == "block_column":
+                        shape = layers[j].shape
+                        conv = layers[j].reshape(shape[0], -1)
+                        # print('weight.shape', conv.shape)
+                        if shape[0] == 30522:
+                            conv = conv.expand(30720, 768)
+                        if conv.shape[0] % block_row_width != 0:
+                            print("the layer size (cross_f) is not divisible", conv.shape[0], block_row_width)
+                            # raise SyntaxError("block_size error")
+
+                        convfrag = torch.chunk(conv, block_row_width, dim=0)
+
+                        mat = None
+                        for k in range(len(convfrag)):
+                            if mat is None:
+                                mat = convfrag[k]
+                            else:
+                                mat = torch.cat((mat, convfrag[k]), 1)
+
+                        l1_loss = l1_loss + penalty_factors[layers_names[j]] * torch.sum(rew * torch.norm(mat, dim=0))
+
+                    else:
+                        raise SyntaxError("Unknown sparsity type")
+                    
+                    
+                    # print("!!! Layer name: ", layers_names[j], "penalty_factor: ", penalty_factors[layers_names[j]])
+            
 
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
@@ -225,6 +499,19 @@ def train(args, train_dataset, model, tokenizer, args_ai):
                 loss.backward()
 
             tr_loss += loss.item()
+
+            if args.masked_retrain:
+                # with torch.no_grad():
+                for name, W in (model.named_parameters()):
+                    # print("model:",args.logging_dir.split("/")[0][-5:])
+                    # print("!!!!!",name)
+                    if "mask_emb" in name:
+                        continue
+                    if name in masks:
+                        W.grad *= masks[name]
+                        # print("!!!!!! Works well!")
+
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -236,18 +523,23 @@ def train(args, train_dataset, model, tokenizer, args_ai):
                 CL.after_scheduler_step(epoch=epoch)
                 model.zero_grad()
                 global_step += 1
-
+                #print('global_step',global_step)
+                #print('args.local_rank',args.local_rank)
+                #print('global_step % args.logging_steps',global_step % args.logging_steps)
                 # Log metrics
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Only evaluate when single GPU otherwise metrics may not average well
                     if args.local_rank == -1 and args.evaluate_during_training:
+                        #print('evaluate during training')
                         results = evaluate(args, model, tokenizer)
                         for key, value in results.items():
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-                        xgen_record(args_ai, model, results['best_f1'], epoch=epoch, onnx_file_path="mobilebert384.onnx")
+
+                        xgen_record(args_ai, model, results['best_f1'], epoch=epoch, onnx_file_path="mobilebert384_scale.onnx")
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
                     logging_loss = tr_loss
+                    #logger.info("Evaluation Results: {}".format(results))
 
                 # Save model checkpoint
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
@@ -267,6 +559,11 @@ def train(args, train_dataset, model, tokenizer, args_ai):
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+
+        if args.masked_retrain:
+            compression_rate = testers.test_irregular_sparsity(model)
+            #tb_writer.add_scalar(args.logging_dir.split("/")[1]+'/'+log_name+'/compression_rate', compression_rate, epoch)  # Save the calculated compression rate only once! -libn
+
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -275,6 +572,7 @@ def train(args, train_dataset, model, tokenizer, args_ai):
         tb_writer.close()
 
     return global_step, tr_loss / global_step
+
 
 
 def evaluate(args, model, tokenizer, prefix=""):
@@ -327,18 +625,6 @@ def evaluate(args, model, tokenizer, prefix=""):
                     )
 
             outputs = model(**inputs)
-
-        # onnx_model_path = f"{args.output_dir}/{args.model_type}384.onnx"
-        # from torch.onnx import export
-        # export(
-        #     model,
-        #     (batch[0], batch[1]),
-        #     f=onnx_model_path,
-        #     input_names = ["input_ids","attention_mask"],
-        #     do_constant_folding=True,
-        #     enable_onnx_checker=True,
-        #     opset_version=11,
-        #     )
 
         for i, feature_index in enumerate(feature_indices):
             eval_feature = features[feature_index.item()]
@@ -493,8 +779,21 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         return dataset, examples, features
     return dataset
 
+def deleteEncodingLayers(model, num_layers_to_keep):  # must pass in the full bert model
+    oldModuleList = model.bert.encoder.layer
+    newModuleList = nn.ModuleList()
 
-def training_main(args_ai=None):
+    # Now iterate over all layers, only keepign only the relevant layers.
+    for i in range(0, num_layers_to_keep):
+        newModuleList.append(oldModuleList[i])
+
+    # create a copy of the model, modify it with the new list, and return
+    copyOfModel = copy.deepcopy(model)
+    copyOfModel.bert.encoder.layer = newModuleList
+
+    return copyOfModel
+
+def training_main():
     parser = argparse.ArgumentParser()
 
     # Required parameters
@@ -506,7 +805,7 @@ def training_main(args_ai=None):
     )
     parser.add_argument(
         "--model_name_or_path",
-        default="google/mobilebert-uncased",
+        default="pretrained",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models",
     )
@@ -527,14 +826,14 @@ def training_main(args_ai=None):
     )
     parser.add_argument(
         "--train_file",
-        default="squad/train-v1.1.json",
+        default="squad1.1/train-v1.1.json",
         type=str,
         help="The input training file. If a data dir is specified, will look for the file there"
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
     )
     parser.add_argument(
         "--predict_file",
-        default="squad/dev-v1.1.json",
+        default="squad1.1/dev-v1.1.json",
         type=str,
         help="The input evaluation file. If a data dir is specified, will look for the file there"
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
@@ -600,7 +899,7 @@ def training_main(args_ai=None):
     parser.add_argument(
         "--per_gpu_eval_batch_size", default=16, type=int, help="Batch size per GPU/CPU for evaluation."
     )
-    parser.add_argument("--learning_rate", default=3e-5, type=float, help="The initial learning rate for Adam.")
+    parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -611,7 +910,7 @@ def training_main(args_ai=None):
     parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
-        "--num_train_epochs", default=1.0, type=float, help="Total number of training epochs to perform."
+        "--num_train_epochs", default=3.0, type=float, help="Total number of training epochs to perform."
     )
     parser.add_argument(
         "--max_steps",
@@ -622,7 +921,7 @@ def training_main(args_ai=None):
     parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
     parser.add_argument(
         "--n_best_size",
-        default=16,
+        default=20,
         type=int,
         help="The total number of n-best predictions to generate in the nbest_predictions.json output file.",
     )
@@ -647,7 +946,7 @@ def training_main(args_ai=None):
     )
 
     parser.add_argument("--logging_steps", type=int, default=500, help="Log every X updates steps.")
-    parser.add_argument("--save_steps", type=int, default=10000, help="Save checkpoint every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=2000, help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--eval_all_checkpoints",
         action="store_true",
@@ -678,9 +977,37 @@ def training_main(args_ai=None):
     parser.add_argument("--server_ip", type=str, default="", help="Can be used for distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
 
+    #reweighted training:
+    parser.add_argument('--rew', action='store_true', default=False,
+                    help="for reweighted l1 training")
+    parser.add_argument('--masked_retrain', action='store_true', default=False,
+                        help='for masked retrain')
+    parser.add_argument('--block_row_division', type=int, default=64,
+                    help='the number of division for each row for block-wise pruning')
+    parser.add_argument('--block_row_width', type=int, default=0,
+                    help='the width of the pruned block for each row')
+
+    parser.add_argument("--penalty_config_file",
+        type=str,
+        default="squad-penalty_mobilebert-4",
+        help="penalty config file name",
+    )
+    parser.add_argument("--prune_ratio_config",
+        type=str,
+        default=None,
+        help="pruning ratio config file name",
+    )
+    parser.add_argument('--sparsity_type', type=str, default='block_filter',
+                    help ="define sparsity_type: [irregular,column,filter]")
+    parser.add_argument('--lr-decay', type=int, default=30, metavar='LR_decay',
+                        help='how many every epoch before lr drop (default: 30)')
+    parser.add_argument("--lr_retrain", default=0.0001, type=float, help="learning rate for retraining")
+
+
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
     args = parser.parse_args()
     user_args, args_ai = xgen_init(args, map=COCOPIE_MAP)
+
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
         logger.warning(
@@ -760,6 +1087,9 @@ def training_main(args_ai=None):
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
+    
+    #######remove layers
+    #model = deleteEncodingLayers(model,5)
 
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
@@ -833,7 +1163,7 @@ def training_main(args_ai=None):
 
             result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
             results.update(result)
-    xgen_record(args_ai, model, results['best_f1'], epoch=-1, onnx_file_path="mobilebert384.onnx")
+    xgen_record(args_ai, model, results['best_f1'], epoch=-1, onnx_file_path="mobilebert384_scale.onnx")
     logger.info("Results: {}".format(results))
 
     return results
