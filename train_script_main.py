@@ -61,7 +61,10 @@ except ImportError:
 
 from co_lib import Co_Lib as CL
 from xgen_tools import *
-COCOPIE_MAP = {'num_train_epochs' : 'common_train_epochs'}
+COCOPIE_MAP = {'num_train_epochs' : 'common_train_epochs', 
+               'per_gpu_train_batch_size':'batch_size', 
+               'per_gpu_eval_batch_size':'batch_size'
+              }
 
 
 logger = logging.getLogger(__name__)
@@ -1006,7 +1009,7 @@ def training_main():
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
     args = parser.parse_args()
-    user_args, args_ai = xgen_init(args, map=COCOPIE_MAP)
+    args, args_ai = xgen_init(args, map=COCOPIE_MAP)
 
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
