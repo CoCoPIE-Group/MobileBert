@@ -21,9 +21,9 @@
     ]
   },
   "training_script_args": {
-    "common_train_epochs": 2,
+    "common_train_epochs": 1,
     "model_type": "mobilebert",
-    "model_name_or_path": "pretrained",
+    "model_name_or_path": "finetuned",
     "do_train": true,
     "do_eval": true,
     "do_lower_case": true,
@@ -59,7 +59,7 @@
     "searching_variable": "scaling_factor",
     "searching_range": [
       1,
-      23
+      1
     ],
     "searching_granularity": 1
   }
