@@ -23,8 +23,8 @@
   "training_script_args": {
     "common_train_epochs": 1,
     "model_type": "mobilebert",
-    "model_name_or_path": "pretrained",
-    "do_train": true,
+    "model_name_or_path": "finetuned",
+    "do_train": false,
     "do_eval": true,
     "do_lower_case": true,
     "local_rank": -1,
