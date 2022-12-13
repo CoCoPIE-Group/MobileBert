@@ -741,7 +741,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     else:
         logger.info("Creating features from dataset file at %s", input_dir)
 
-        if not args.data_dir and ((evaluate and not args.predict_file) or (not evaluate and not args.train_file)):
+        if not args.data_dir and ((evaluate and not args.eval_data_path) or (not evaluate and not args.train_data_path)):
             try:
                 import tensorflow_datasets as tfds
             except ImportError:
@@ -755,9 +755,9 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         else:
             processor = SquadV2Processor() if args.version_2_with_negative else SquadV1Processor()
             if evaluate:
-                examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
+                examples = processor.get_dev_examples(args.data_dir, filename=args.eval_data_path)
             else:
-                examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
+                examples = processor.get_train_examples(args.data_dir, filename=args.train_data_path)
 
         features, dataset = squad_convert_examples_to_features(
             examples=examples,
@@ -828,14 +828,14 @@ def training_main():
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
     )
     parser.add_argument(
-        "--train_file",
+        "--train_data_path",
         default="squad1.1/train-v1.1.json",
         type=str,
         help="The input training file. If a data dir is specified, will look for the file there"
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
     )
     parser.add_argument(
-        "--predict_file",
+        "--eval_data_path",
         default="squad1.1/dev-v1.1.json",
         type=str,
         help="The input evaluation file. If a data dir is specified, will look for the file there"
