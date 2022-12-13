@@ -21,7 +21,7 @@
     ]
   },
   "training_script_args": {
-    "common_train_epochs": 1,
+    "common_train_epochs": 4,
     "model_type": "mobilebert",
     "model_name_or_path": "pretrained",
     "do_train": true,
